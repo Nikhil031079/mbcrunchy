@@ -1,3 +1,7 @@
+import { Dialog } from "@radix-ui/react-dialog";
+import { AlertTriangle, ChevronDown, ExternalLink } from "lucide-react";
+import React, { useEffect, useState } from "react";
+
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -6,28 +10,57 @@ import {
 } from "@/components/ui/collapsible";
 import {
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Dialog } from "@radix-ui/react-dialog";
-import { ChevronDown, ExternalLink } from "lucide-react";
-import React, { useEffect, useState } from "react";
 
-type SyncError = {
+type GenericError = {
   error: string;
   stack: string;
-  filename: string;
-  lineno: number;
-  colno: number;
+  filename?: string;
+  lineno?: number;
+  colno?: number;
+  componentStack?: string;
 };
 
-type AsyncError = {
-  error: string;
-  stack: string;
-};
+function normalizeError(value: unknown): GenericError {
+  if (value instanceof Error) {
+    return {
+      error: value.message || "Unknown runtime error",
+      stack: value.stack || "",
+    };
+  }
 
-type GenericError = SyncError | AsyncError;
+  if (typeof value === "string") {
+    return { error: value || "Unknown runtime error", stack: "" };
+  }
+
+  if (value && typeof value === "object") {
+    const candidate = value as {
+      message?: unknown;
+      error?: unknown;
+      stack?: unknown;
+    };
+    const message =
+      typeof candidate.message === "string"
+        ? candidate.message
+        : typeof candidate.error === "string"
+          ? candidate.error
+          : "";
+
+    return {
+      error: message || "Unknown runtime error",
+      stack: typeof candidate.stack === "string" ? candidate.stack : "",
+    };
+  }
+
+  return {
+    error: value == null ? "Unknown runtime error" : String(value),
+    stack: "",
+  };
+}
 
 async function reportErrorToVly(errorData: {
   error: string;
@@ -36,17 +69,20 @@ async function reportErrorToVly(errorData: {
   lineno?: number;
   colno?: number;
 }) {
-  if (!import.meta.env.VITE_VLY_APP_ID) {
+  const appId = import.meta.env.VITE_VLY_APP_ID;
+  const monitoringUrl = import.meta.env.VITE_VLY_MONITORING_URL;
+
+  if (!appId || !monitoringUrl) {
     return;
   }
 
   try {
-    await fetch(import.meta.env.VITE_VLY_MONITORING_URL, {
+    await fetch(monitoringUrl, {
       method: "POST",
       body: JSON.stringify({
         ...errorData,
         url: window.location.href,
-        projectSemanticIdentifier: import.meta.env.VITE_VLY_APP_ID,
+        projectSemanticIdentifier: appId,
       }),
     });
   } catch (error) {
@@ -61,40 +97,77 @@ function ErrorDialog({
   error: GenericError;
   setError: (error: GenericError | null) => void;
 }) {
+  const technicalDetails = [
+    error.filename &&
+      `Source: ${error.filename}${error.lineno ? `:${error.lineno}` : ""}${error.colno ? `:${error.colno}` : ""}`,
+    error.stack && `Stack trace:\n${error.stack}`,
+    error.componentStack && `Component stack:\n${error.componentStack}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
   return (
     <Dialog
       defaultOpen={true}
-      onOpenChange={() => {
-        setError(null);
+      onOpenChange={(open) => {
+        if (!open) setError(null);
       }}
     >
-      <DialogContent className="bg-red-700 text-white max-w-4xl">
-        <DialogHeader>
-          <DialogTitle>Runtime Error</DialogTitle>
+      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto border-zinc-700 bg-zinc-950 text-zinc-100 sm:max-w-lg">
+        <DialogHeader className="pr-8">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-400/10">
+              <AlertTriangle className="h-4 w-4 text-amber-300" />
+            </div>
+            <div>
+              <DialogTitle className="text-base">Runtime error</DialogTitle>
+              <DialogDescription className="mt-1 text-zinc-400">
+                The preview stopped while rendering. Open the editor to fix the
+                issue, or close this message to keep browsing.
+              </DialogDescription>
+            </div>
+          </div>
         </DialogHeader>
-        A runtime error occurred. Open the vly editor to automatically debug the
-        error.
-        <div className="mt-4">
+
+        <div className="rounded-md border border-amber-400/20 bg-amber-400/5 px-3 py-2.5">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-amber-200/70">
+            Error message
+          </div>
+          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-zinc-200">
+            {error.error}
+          </p>
+        </div>
+
+        {technicalDetails && (
           <Collapsible>
-            <CollapsibleTrigger>
-              <div className="flex items-center font-bold cursor-pointer">
-                See error details <ChevronDown />
-              </div>
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-zinc-400 transition-colors hover:text-zinc-100"
+              >
+                <ChevronDown className="h-3.5 w-3.5" />
+                Show technical details
+              </button>
             </CollapsibleTrigger>
-            <CollapsibleContent className="max-w-[460px]">
-              <div className="mt-2 p-3 bg-neutral-800 rounded text-white text-sm overflow-x-auto max-h-60 max-w-full [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-                <pre className="whitespace-pre">{error.stack}</pre>
-              </div>
+            <CollapsibleContent>
+              <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-zinc-800 bg-black/30 p-3 font-mono text-[11px] leading-relaxed text-zinc-400">
+                {technicalDetails}
+              </pre>
             </CollapsibleContent>
           </Collapsible>
-        </div>
-        <DialogFooter>
+        )}
+
+        <DialogFooter className="gap-3 sm:items-center">
+          <span className="text-xs text-zinc-500">
+            Your error details are also available in chat.
+          </span>
           <a
             href={`https://freebuff.com/project/${import.meta.env.VITE_VLY_APP_ID}`}
             target="_blank"
+            rel="noreferrer"
           >
-            <Button>
-              <ExternalLink /> Open editor
+            <Button className="bg-zinc-100 text-zinc-900 hover:bg-white">
+              <ExternalLink className="h-4 w-4" /> Open editor
             </Button>
           </a>
         </DialogFooter>
@@ -119,46 +192,43 @@ class ErrorBoundary extends React.Component<
     this.state = { hasError: false, error: null };
   }
 
-  static getDerivedStateFromError() {
-    // Update state so the next render will show the fallback UI.
-    return { hasError: true };
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return {
+      hasError: true,
+      error: normalizeError(error),
+    };
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    // logErrorToMyService(
-    //   error,
-    //   // Example "componentStack":
-    //   //   in ComponentThatThrows (created by App)
-    //   //   in ErrorBoundary (created by App)
-    //   //   in div (created by App)
-    //   //   in App
-    //   info.componentStack,
-    //   // Warning: `captureOwnerStack` is not available in production.
-    //   React.captureOwnerStack(),
-    // );
+    const normalizedError = normalizeError(error);
+    const componentStack = info.componentStack?.trim();
+
     reportErrorToVly({
-      error: error.message,
-      stackTrace: error.stack,
+      error: normalizedError.error,
+      stackTrace: [normalizedError.stack, componentStack]
+        .filter(Boolean)
+        .join("\n\n"),
     });
-    this.setState({
+
+    this.setState((state) => ({
       hasError: true,
       error: {
-        error: error.message,
-        stack: info.componentStack ?? error.stack ?? "",
+        ...(state.error ?? normalizedError),
+        componentStack,
       },
-    });
+    }));
   }
 
   render() {
-    if (this.state.hasError) {
-      // You can render any custom fallback UI
+    if (this.state.hasError && this.state.error) {
       return (
         <ErrorDialog
-          error={{
-            error: "An error occurred",
-            stack: "",
+          error={this.state.error}
+          setError={(error) => {
+            if (error === null) {
+              this.setState({ hasError: false, error: null });
+            }
           }}
-          setError={() => {}}
         />
       );
     }
@@ -177,25 +247,23 @@ export function InstrumentationProvider({
   useEffect(() => {
     const handleError = async (event: ErrorEvent) => {
       try {
-        console.log(event);
         event.preventDefault();
-        setError({
-          error: event.message,
-          stack: event.error?.stack || "",
-          filename: event.filename || "",
+        const normalizedError = normalizeError(event.error ?? event.message);
+        const capturedError = {
+          ...normalizedError,
+          filename: event.filename || undefined,
+          lineno: event.lineno || undefined,
+          colno: event.colno || undefined,
+        };
+        setError(capturedError);
+
+        await reportErrorToVly({
+          error: normalizedError.error,
+          stackTrace: normalizedError.stack,
+          filename: event.filename,
           lineno: event.lineno,
           colno: event.colno,
         });
-
-        if (import.meta.env.VITE_VLY_APP_ID) {
-          await reportErrorToVly({
-            error: event.message,
-            stackTrace: event.error?.stack,
-            filename: event.filename,
-            lineno: event.lineno,
-            colno: event.colno,
-          });
-        }
       } catch (error) {
         console.error("Error in handleError:", error);
       }
@@ -203,18 +271,13 @@ export function InstrumentationProvider({
 
     const handleRejection = async (event: PromiseRejectionEvent) => {
       try {
-        console.error(event);
+        const normalizedError = normalizeError(event.reason);
+        console.error("[Freebuff runtime error]", normalizedError.error);
+        setError(normalizedError);
 
-        if (import.meta.env.VITE_VLY_APP_ID) {
-          await reportErrorToVly({
-            error: event.reason.message,
-            stackTrace: event.reason.stack,
-          });
-        }
-
-        setError({
-          error: event.reason.message,
-          stack: event.reason.stack,
+        await reportErrorToVly({
+          error: normalizedError.error,
+          stackTrace: normalizedError.stack,
         });
       } catch (error) {
         console.error("Error in handleRejection:", error);
