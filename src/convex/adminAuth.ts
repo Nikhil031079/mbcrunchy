@@ -55,14 +55,14 @@ export const initializeAdmin = mutation({
   args: {},
   handler: async (ctx) => {
     const existing = await ctx.db.query("adminAuth").withIndex("username", (q) => q.eq("username", DEFAULT_USERNAME)).first();
-    if (existing) return { initialized: false, message: "Already exists" };
+    if (existing) return { initialized: false, message: "Admin already exists" };
     const salt = generateSalt();
     const passwordHash = await hashPassword(DEFAULT_PASSWORD, salt);
     const recoveryKey = generateRecoveryKey();
     const recoveryKeyHash = await hashPassword(recoveryKey, salt);
     const now = Date.now();
     await ctx.db.insert("adminAuth", { username: DEFAULT_USERNAME, passwordHash, salt, recoveryKey, recoveryKeyHash, failedLoginAttempts: 0, createdAt: now, updatedAt: now });
-    return { initialized: true, recoveryKey };
+    return { initialized: true, message: "Admin created", recoveryKey };
   },
 });
 
@@ -70,8 +70,11 @@ export const verifyPassword = query({
   args: { password: v.string() },
   handler: async (ctx, args) => {
     const admin = await ctx.db.query("adminAuth").withIndex("username", (q) => q.eq("username", DEFAULT_USERNAME)).first();
-    if (!admin) return { valid: false };
-    if (admin.lockedUntil && admin.lockedUntil > Date.now()) return { valid: false, locked: true };
+    if (!admin) return { valid: false, message: "Admin not found" };
+    if (admin.lockedUntil && admin.lockedUntil > Date.now()) {
+      const remaining = Math.ceil((admin.lockedUntil - Date.now()) / 1000);
+      return { valid: false, message: `Locked. Try again in ${remaining}s`, locked: true, remainingSeconds: remaining };
+    }
     const hash = await hashPassword(args.password, admin.salt);
     return { valid: hash === admin.passwordHash };
   },
@@ -83,18 +86,23 @@ export const login = mutation({
     const admin = await ctx.db.query("adminAuth").withIndex("username", (q) => q.eq("username", DEFAULT_USERNAME)).first();
     if (!admin) return { success: false, message: "Admin not found" };
     const now = Date.now();
-    if (admin.lockedUntil && admin.lockedUntil > now) return { success: false, message: "Account locked", locked: true };
+    if (admin.lockedUntil && admin.lockedUntil > now) {
+      return { success: false, message: `Locked. Try again in ${Math.ceil((admin.lockedUntil - now) / 1000)}s`, locked: true };
+    }
     const hash = await hashPassword(args.password, admin.salt);
     if (hash !== admin.passwordHash) {
       const failed = (admin.failedLoginAttempts || 0) + 1;
-      const update: any = { failedLoginAttempts: failed, updatedAt: now };
+      const update: Record<string, any> = { failedLoginAttempts: failed, updatedAt: now };
       if (failed >= MAX_FAILED_ATTEMPTS) update.lockedUntil = now + LOCKOUT_DURATION_MS;
       await ctx.db.patch(admin._id, update);
-      return { success: false, message: `Invalid. ${MAX_FAILED_ATTEMPTS - failed} attempts left`, attemptsRemaining: Math.max(0, MAX_FAILED_ATTEMPTS - failed) };
+      await ctx.db.insert("adminAuditLogs", { adminId: admin._id, action: "login_failed", details: `Failed ${failed}/${MAX_FAILED_ATTEMPTS}`, ipAddress: args.ipAddress, createdAt: now });
+      const remaining = MAX_FAILED_ATTEMPTS - failed;
+      return { success: false, message: remaining > 0 ? `Invalid. ${remaining} attempts left` : "Locked 15min", attemptsRemaining: Math.max(0, remaining), locked: failed >= MAX_FAILED_ATTEMPTS };
     }
     const token = generateSessionToken();
-    await ctx.db.patch(admin._id, { failedLoginAttempts: 0, lockedUntil: undefined, lastLoginAt: now, updatedAt: now });
+    await ctx.db.patch(admin._id, { failedLoginAttempts: 0, lockedUntil: undefined, lastLoginAt: now, lastLoginIp: args.ipAddress, updatedAt: now });
     await ctx.db.insert("adminSessions", { adminId: admin._id, token, ipAddress: args.ipAddress, userAgent: args.userAgent, expiresAt: now + SESSION_DURATION_MS, createdAt: now });
+    await ctx.db.insert("adminAuditLogs", { adminId: admin._id, action: "login", details: "Success", ipAddress: args.ipAddress, createdAt: now });
     return { success: true, token, adminId: admin._id, expiresAt: now + SESSION_DURATION_MS };
   },
 });
@@ -103,8 +111,17 @@ export const verifySession = query({
   args: { token: v.string() },
   handler: async (ctx, args) => {
     const session = await ctx.db.query("adminSessions").withIndex("token", (q) => q.eq("token", args.token)).first();
-    if (!session || session.expiresAt < Date.now()) return { valid: false };
+    if (!session) return { valid: false, message: "Invalid session" };
+    if (session.expiresAt < Date.now()) return { valid: false, message: "Expired" };
     return { valid: true, adminId: session.adminId };
+  },
+});
+
+export const logout = mutation({
+  args: { token: v.string() },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.query("adminSessions").withIndex("token", (q) => q.eq("token", args.token)).first();
+    if (session) { await ctx.db.insert("adminAuditLogs", { adminId: session.adminId, action: "logout", createdAt: Date.now() }); await ctx.db.delete(session._id); }
   },
 });
 
@@ -112,14 +129,25 @@ export const changePassword = mutation({
   args: { currentPassword: v.string(), newPassword: v.string(), token: v.string() },
   handler: async (ctx, args) => {
     const session = await ctx.db.query("adminSessions").withIndex("token", (q) => q.eq("token", args.token)).first();
-    if (!session || session.expiresAt < Date.now()) return { success: false, message: "Session expired" };
+    if (!session || session.expiresAt < Date.now()) return { success: false, message: "Invalid session" };
     const admin = await ctx.db.get(session.adminId);
-    if (!admin) return { success: false };
-    if ((await hashPassword(args.currentPassword, admin.salt)) !== admin.passwordHash) return { success: false, message: "Wrong password" };
-    if (args.newPassword.length < 6) return { success: false, message: "Min 6 chars" };
+    if (!admin) return { success: false, message: "Not found" };
+    if (await hashPassword(args.currentPassword, admin.salt) !== admin.passwordHash) return { success: false, message: "Wrong password" };
+    if (args.newPassword.length < 6) return { success: false, message: "Min 6 characters" };
     const newSalt = generateSalt();
-    await ctx.db.patch(admin._id, { passwordHash: await hashPassword(args.newPassword, newSalt), salt: newSalt, updatedAt: Date.now() });
-    return { success: true };
+    const newHash = await hashPassword(args.newPassword, newSalt);
+    await ctx.db.patch(admin._id, { passwordHash: newHash, salt: newSalt, updatedAt: Date.now() });
+    await ctx.db.insert("adminAuditLogs", { adminId: admin._id, action: "password_changed", createdAt: Date.now() });
+    return { success: true, message: "Password changed" };
+  },
+});
+
+export const getRecoveryKeyHint = query({
+  args: {},
+  handler: async (ctx) => {
+    const admin = await ctx.db.query("adminAuth").withIndex("username", (q) => q.eq("username", DEFAULT_USERNAME)).first();
+    if (!admin || !admin.recoveryKey) return { available: false };
+    return { available: true, hint: admin.recoveryKey.substring(0, 5) + "****-****-****" + admin.recoveryKey.substring(19) };
   },
 });
 
@@ -127,11 +155,15 @@ export const resetPasswordWithRecoveryKey = mutation({
   args: { recoveryKey: v.string(), newPassword: v.string() },
   handler: async (ctx, args) => {
     const admin = await ctx.db.query("adminAuth").withIndex("username", (q) => q.eq("username", DEFAULT_USERNAME)).first();
-    if (!admin || !admin.recoveryKeyHash) return { success: false, message: "No key" };
-    if ((await hashPassword(args.recoveryKey.toUpperCase(), admin.salt)) !== admin.recoveryKeyHash) return { success: false, message: "Invalid key" };
+    if (!admin || !admin.recoveryKeyHash) return { success: false, message: "No recovery key set" };
+    const keyHash = await hashPassword(args.recoveryKey.toUpperCase(), admin.salt);
+    if (keyHash !== admin.recoveryKeyHash) return { success: false, message: "Invalid key" };
+    if (args.newPassword.length < 6) return { success: false, message: "Min 6 characters" };
     const newSalt = generateSalt();
-    await ctx.db.patch(admin._id, { passwordHash: await hashPassword(args.newPassword, newSalt), salt: newSalt, failedLoginAttempts: 0, lockedUntil: undefined, updatedAt: Date.now() });
-    return { success: true };
+    const newHash = await hashPassword(args.newPassword, newSalt);
+    await ctx.db.patch(admin._id, { passwordHash: newHash, salt: newSalt, failedLoginAttempts: 0, lockedUntil: undefined, updatedAt: Date.now() });
+    await ctx.db.insert("adminAuditLogs", { adminId: admin._id, action: "password_reset", createdAt: Date.now() });
+    return { success: true, message: "Password reset" };
   },
 });
 
@@ -149,7 +181,8 @@ export const getAdminInfo = query({
 export const getAuditLogs = query({
   args: { token: v.string(), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
-    return (await ctx.db.query("adminAuditLogs").order("desc").take(args.limit || 50)).map(l => ({ action: l.action, details: l.details, createdAt: l.createdAt }));
+    const logs = await ctx.db.query("adminAuditLogs").order("desc").take(args.limit || 50);
+    return logs.map((l) => ({ action: l.action, details: l.details, ipAddress: l.ipAddress, createdAt: l.createdAt }));
   },
 });
 
@@ -158,9 +191,8 @@ export const getActiveSessions = query({
   handler: async (ctx, args) => {
     const current = await ctx.db.query("adminSessions").withIndex("token", (q) => q.eq("token", args.token)).first();
     if (!current) return [];
-    return (await ctx.db.query("adminSessions").withIndex("adminId", (q) => q.eq("adminId", current.adminId)).collect())
-      .filter(s => s.expiresAt > Date.now())
-      .map(s => ({ id: s._id, ipAddress: s.ipAddress, createdAt: s.createdAt, expiresAt: s.expiresAt, isCurrent: s.token === args.token }));
+    const sessions = await ctx.db.query("adminSessions").withIndex("adminId", (q) => q.eq("adminId", current.adminId)).collect();
+    return sessions.filter((s) => s.expiresAt > Date.now()).map((s) => ({ id: s._id, ipAddress: s.ipAddress, userAgent: s.userAgent, createdAt: s.createdAt, expiresAt: s.expiresAt, isCurrent: s.token === args.token }));
   },
 });
 
@@ -172,13 +204,5 @@ export const revokeSession = mutation({
     const target = await ctx.db.get(args.sessionIdToRevoke);
     if (target?.adminId === current.adminId) { await ctx.db.delete(args.sessionIdToRevoke); return { success: true }; }
     return { success: false };
-  },
-});
-
-export const logout = mutation({
-  args: { token: v.string() },
-  handler: async (ctx, args) => {
-    const session = await ctx.db.query("adminSessions").withIndex("token", (q) => q.eq("token", args.token)).first();
-    if (session) await ctx.db.delete(session._id);
   },
 });

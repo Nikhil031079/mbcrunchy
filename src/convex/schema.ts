@@ -6,11 +6,11 @@ export default defineSchema({
   ...authTables,
 
   adminAuth: defineTable({
-    name: v.optional(v.string()),phone: v.optional(v.string()),username: v.optional(v.string()), email: v.optional(v.string()), lastPasswordChange: v.optional(v.number()),
+    username: v.string(),
     passwordHash: v.string(),
     salt: v.string(),
     recoveryKey: v.optional(v.string()),
-    recoveryKeyHash: v.optional(v.string()),recoveryKeySalt: v.optional(v.string()),twoFactorEnabled: v.optional(v.boolean()),recoveryFailedAttempts: v.optional(v.number()),
+    recoveryKeyHash: v.optional(v.string()),
     failedLoginAttempts: v.optional(v.number()),
     lockedUntil: v.optional(v.number()),
     lastLoginAt: v.optional(v.number()),
@@ -26,7 +26,7 @@ export default defineSchema({
     userAgent: v.optional(v.string()),
     expiresAt: v.number(),
     createdAt: v.number(),
-  }).index("token", ["token"]).index("adminId", ["adminId"]),
+  }).index("token", ["token"]),
 
   adminAuditLogs: defineTable({
     adminId: v.id("adminAuth"),
@@ -48,8 +48,8 @@ export default defineSchema({
     description: v.optional(v.string()),
     image: v.optional(v.string()),
     parentId: v.optional(v.id("categories")),
-    businessType: v.optional(v.union(v.literal("kitchen"), v.literal("mart"), v.literal("both"))),
-    displayOrder: v.optional(v.number()),order: v.optional(v.number()),
+    businessType: v.union(v.literal("kitchen"), v.literal("mart"), v.literal("both")),
+    displayOrder: v.number(),
     isActive: v.boolean(),
     createdAt: v.number(),
     updatedAt: v.number(),
